@@ -1,27 +1,200 @@
-Ladder — do these in order
-1. VGA direct write (next, ~20 lines)
-Stop using int 0x10. Write to 0xB8000 yourself: addr = 0xB8000 + (row*80 + col)*2, byte 0 = ASCII, byte 1 = attribute (0x0F = white on black).
-Why: teaches that "printing" is just memory the hardware scans. Also survives leaving real mode. First time you'll need ES.
+# TODO — game OS, milestones M0..M6
+# "Every line known. Minimum CPU. Minimum RAM. Zero GPU driver."
 
-2. Load a second sector (int 0x13, ah=0x02)
-Move the real code to sector 2 (LBA 1), loaded at 0x1000:0000. Boot sector just loads it and jumps.
-Why: breaks the 512-byte wall. This is the standard stage1 / stage2 split.
+## NORTH STAR
 
-3. Make a bootable disk + ISO
-stage1 can't be a bare .bin anymore once you want partitions/GRUB later. Learn dd to a .img and boot with -drive format=raw.
+An OS that boots straight into a shell, lets me write a program in my own
+assembly language inside the OS, and runs it as a game at 60 fps.
+Installs on real hardware later. I can read and explain every line.
 
-4. Enter protected mode — the big one
-Order inside it matters: cli → load GDT (lgdt) → set CR0.PE → far jmp to 32-bit code → reload all segment registers with selectors → set up a new flat stack.
-Why: 32-bit addressing, no more 64 KB windows, access to >1 MB RAM.
+M6 = "a playable game written in my own asm, on my own OS, at 60 fps".
+Nothing after M6 is planned here on purpose.
 
-5. IDT + interrupts — remap the PIC to 0x20–0x2F, then int 0x20 becomes your timer. Add a keyboard handler.
-Why: everything async (timers, input, exceptions) depends on this. Your first triple-fault debugging session happens here.
+---
 
-6. Paging
-Identity-map the first 4 MB, enable CR0.PG. Then a bitmap/heap allocator.
+## RESOURCE BUDGET (hard limits, measure every milestone)
 
-7. C kernel — cross-compile i686-elf, link with a custom linker script at 0x100000, call kmain(). From here you can mostly write C.
+| Target                  | Limit            | Why it is achievable                            |
+|-------------------------|------------------|-------------------------------------------------|
+| Kernel binary           | <= 32 KiB        | no libc, no C++, no tables you don't use        |
+| Whole OS image          | <= 96 KiB        | boot + stage2 + kernel, no assets baked in      |
+| RAM used at idle        | <= 256 KiB       | static arenas, no per-frame allocation          |
+| Boot to shell           | <= 300 ms (QEMU) | no ACPI, no probing, no init ordering           |
+| CPU at idle             | ~0 %             | HLT in the idle loop, timer off when unused     |
+| CPU while game runs     | <= 60 % of 1 core| fixed-point math, dirty rects, no overdraw      |
+| Frame time @1024x768x32 | <= 16.6 ms       | measured per stage, not guessed                 |
+| GPU usage               | 0 driver         | one mode set at boot, then MMIO stores only     |
+| Heap allocations/frame  | 0                | all buffers preallocated at startup             |
 
-Two habits that will save you days
-Debug with the log, not your eyes. qemu-system-x86_64 -d int,cpu_reset -D qemu.log — a triple fault prints the interrupt dump here. Or -s -S + gdb -ex "target remote :1234".
-Commit after every working rung. OS dev regressions are brutal; a git init at step 1 pays for itself at step 4.
+Rules that deliver the budget:
+- Compile: `-Os -ffreestanding -fno-stack-protector -fno-pic -fno-pie
+  -fno-asynchronous-unwind-tables -mno-red-zone -mno-sse -mno-mmx
+  -mgeneral-regs-only` and link `-nostdlib -static`.
+- No floating point. Fixed-point (16.16) for everything: no FPU state in
+  context switches, no soft-float blobs, deterministic.
+- No malloc in the kernel hot paths. Static arenas + a bump allocator;
+  free lists only where really needed.
+- Idle = `hlt`. Input = interrupts. Never poll a device in a loop with a spin.
+- Draw only what changed: dirty rectangles / dirty rows, never full redraw.
+- Prefer hardware help when it is free: VGA text mode costs 0 CPU and 0 RAM.
+- Measure with `rdtsc` and a `perf` shell command. If it is not measured it
+  does not count as optimisation.
+
+---
+
+## FROZEN CONTRACTS (do not change without writing an ADR in docs/)
+
+1. Syscall ABI       — one entry, numbered calls, versioned      (M2)
+2. Executable format — header + sections + entry point           (M3)
+3. Pak format        — magic, version, entry count, offsets      (M3)
+4. Mini-FS layout    — superblock, inode table, data blocks      (M3)
+5. Bytecode ISA      — this is "my assembly", fixed opcodes      (M5)
+6. Driver contract   — probe/init/irq/read/write, no globals     (later)
+
+---
+
+## M0 — DISPLAY  [DONE]
+Goal: prove the boot chain works.
+Built: stage1 (512 B) -> int 0x13 -> stage2 -> VGA text via 0xB8000 + cursor.
+Acceptance: green text on screen, 55 AA signature, image builds via make.
+
+## M1 — CPU CONTROL
+Goal: own the CPU. No BIOS after this point.
+Build:
+  - protected mode switch in stage2 (cli -> A20 -> lgdt -> CR0.PE -> far jmp)
+  - GDT: null, 32-bit code, 32-bit data
+  - IDT: 256 entries; exceptions 0..31 handled (print name + halt)
+  - remap PIC to 0x20..0x2F; mask everything except keyboard (IRQ1)
+  - PIT at 100 Hz (used only for the clock; maskable later)
+  - PS/2 keyboard driver: IRQ1 -> ring buffer -> key events
+  - thin C kernel at 0x10000 called from asm; `puts` in C
+  - idle loop is `hlt`
+Acceptance:
+  - typing echoes on screen via IRQ, not polling
+  - `perf` shows idle CPU near 0 % (QEMU monitor `info cpus` steady)
+  - divide-by-zero and invalid-opcode print their name and halt cleanly
+Budget: kernel <= 16 KiB here.
+Watch out: IDT gates need the right DPL and a 32-bit far return (`iret`),
+and every ISR must `cld` + save/restore the right registers.
+
+## M2 — MEMORY + ABIs
+Goal: real memory management, and freeze the personality of the OS.
+Build:
+  - port to long mode (x86_64) at the START of this milestone, before paging
+    exists, so paging is written once: GDT + 4-level tables + identity map
+    the first 1 GiB using 2 MiB pages (2 tables, not 512)
+  - static arena from the linker end symbol to a fixed ceiling
+  - bitmap heap on top of the arena (4 KiB blocks), debug checks in dev builds
+  - page fault handler that prints CR2 and the error bits, then halts
+  - syscall ABI v1: single `int 0x80`-style gate, rax = call number,
+    rdi/rsi/rdx = args. Calls: exit, write(console), read(key), tick, mmap.
+  - `mem` shell-less debug print: free bytes, used bytes, largest block
+Acceptance:
+  - kernel runs in long mode, paging on, framebuffer/text still reachable
+  - heap survives 10 000 alloc/free pairs with fragmentation reported
+  - page fault on a wild pointer prints the address instead of rebooting
+Budget: kernel <= 32 KiB, idle RAM <= 256 KiB.
+Watch out: in long mode there is no `pushad`, `iret` is `iretq`, and GDT
+entries must stay 8-byte aligned. Stack must be 16-byte aligned at calls.
+
+## M3 — STORAGE + TERMINAL
+Goal: a usable machine. Type commands, read and write files.
+Build:
+  - mini-FS on raw sectors (frozen layout): superblock + inode table
+    + data blocks. No free-list journalling, no permissions, no directories
+    deeper than one level.
+  - block driver: ATA PIO (28-bit LBA), read + write, one sector at a time
+  - terminal: line editor (backspace, cursor), history, command table:
+      help  clear  mem  perf  ls  cat  edit  asm  run  reboot
+  - text output: still VGA text mode (0 CPU, 0 RAM cost)
+Acceptance:
+  - create a file from the shell, reboot, `cat` it back
+  - `perf` prints boot time, idle CPU, free RAM
+  - every command is a table entry, not an if-chain
+Budget: shell binary <= 8 KiB.
+Watch out: ATA PIO needs the 400 ns delay reads between status polls; writing
+without `cache flush` (0xE7) loses the file on reset.
+
+## M4 — EDITOR
+Goal: write source code on the OS itself.
+Build:
+  - full-screen editor on the text grid, own key handling
+  - gap buffer (one allocation, O(1) insert at the cursor)
+  - horizontal scroll, status line (file, line, column, dirty flag)
+  - commands: save, quit, goto line, save-as
+  - redraw only changed rows (dirty row bitmap)
+Acceptance:
+  - type a 200-line file with no visible lag (keystroke -> screen <= 1 frame)
+  - only dirty rows are rewritten (verify with a counters build)
+  - open, edit, save, reopen: content identical
+Budget: editor <= 12 KiB RAM for a 200-line file.
+Watch out: cursor arithmetic off-by-one at the end of a line, and tabs. Pick
+tab = 4 spaces and never look back.
+
+## M5 — ASSEMBLER + VM  (the compiler that belongs inside the OS)
+Goal: write and run a program, in my own assembly, inside my own OS.
+Build:
+  - ISA spec in docs/ISA.md, frozen: 16 x 32-bit registers, fixed 32-bit
+    instructions, memory as one flat byte array.
+    Required ops: mov (reg/imm), add sub and or xor shl shr, load/store
+    byte+word, jmp jz jnz jlt, call ret, push pop, mul (fixed-point),
+    hlt, out (draw pixel/rect), in (key).
+  - assembler: labels, comments, hex/dec literals, db, .org, immediate and
+    register operands, one pass + patch table
+  - VM: fetch/decode/execute loop, 1 MiB of VM memory, instruction budget
+    guard so a bad program cannot hang the machine
+  - `asm file.asm` -> bytecode file, `run file.bin` -> executes it
+Acceptance:
+  - a program that prints, loops, calls a subroutine and reads keys runs
+  - Turing complete: prove it with a loop + conditional + memory (e.g. a
+    tiny state machine or Collatz in asm)
+  - infinite loop is caught by the budget guard, VM exits, shell returns
+Budget: assembler + VM <= 16 KiB; VM interprets >= 5 M instr/s in QEMU.
+Watch out: label resolution order, and signed vs unsigned in `jlt`.
+
+## M6 — FRAMEBUFFER + ENGINE  (the gaming milestone)
+Goal: the game. 60 fps, written in the asm from M5.
+Build:
+  - VBE mode 0x118 (1024x768x32) set once in stage2 (fallback: 800x600x32)
+  - linear framebuffer pointer handed to the kernel, no GPU driver, MMIO only
+  - 8x8 font blitter so the shell and editor run on the framebuffer too
+  - dirty-rect compositor: back buffer + only changed tiles are blitted
+  - sprite blitter with clip + palette-free direct RGB
+  - engine loop: fixed 60 Hz step, input, update, render, `hlt` between frames
+  - one game, written in my asm, using the ISA from M5
+Acceptance:
+  - game at 60 fps, frame time measured and printed by `perf`
+  - CPU during gameplay <= 60 % of one core (QEMU)
+  - shell and editor still work after quitting the game
+  - no heap allocation after the game starts
+Budget: full-screen clear <= 2 ms, sprite blit <= 1 us per 16x16 sprite.
+Watch out: setting the mode after entering protected mode needs a real-mode
+trampoline (BIOS INT 10h). Either set it in stage2 (preferred, simplest) or
+write the trampoline as an exercise — do not call BIOS from long mode.
+
+---
+
+## DO NOT BUILD BEFORE M6
+
+USB, ACPI, SMP, networking, audio, GPU drivers, a C compiler, multitasking,
+processes, virtual memory isolation, filesystems on disk, UEFI, package
+manager, GUI toolkit, multiple games, a debugger.
+Each one is a project. Each one is parked on purpose.
+
+---
+
+## HABITS
+
+- Commit after every working rung. A boot regression is silent.
+- Debug with `qemu -d int,cpu_reset -D qemu.log`, not with eyes.
+- `make check` after every build: size, signature, layout.
+- Write the "why" in docs/ when a decision is made (ADR), especially before
+  changing anything in FROZEN CONTRACTS.
+- One vertical slice per milestone: demo or it did not happen.
+
+## AFTER M6 (parked)
+
+M7 GPT + own installer (installs on real hardware)
+M8 UEFI loader (installs on any machine)
+M9 JIT: bytecode -> x86_64 native
+M10 audio mixer, second game, self-hosted toolchain
