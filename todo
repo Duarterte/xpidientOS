@@ -25,7 +25,10 @@ Nothing after M6 is planned here on purpose.
 | Frame time @1024x768x32 | <= 16.6 ms       | measured per stage, not guessed                 |
 | GPU usage               | 0 driver         | one mode set at boot, then MMIO stores only     |
 | Heap allocations/frame  | 0                | all buffers preallocated at startup             |
-| Cores                   | up to 8          | scales by output region, not by object          |
+| Core count              | discovered       | SIPI sweep, not hardcoded; policy reads `ncpu`   |
+| RAM sizing              | detected (E820)  | heap = clamp(usable*3/4, 256 KiB, 64 MiB)       |
+| Screen                  | auto (VBE list)  | any mode; back buffer sized from heap rule      |
+| Disk sizing             | detected (ATA ID)| superblock totals from IDENTIFY                  |
 | Scaling efficiency      | >= 80 % of N     | N bands on N cores must be >= 0.8N faster       |
 | Lock contention         | < 1 % of runtime | per-CPU data; a global lock on a hot path is a bug |
 
@@ -134,10 +137,16 @@ Build:
   - work model: per-CPU run queue + work-stealing deque
     (push/pop own, steal from a random other queue, retry twice)
   - a `spin` command: N bands of a busy loop on N cores
+  - CORE COUNT IS DISCOVERED, NOT ASSUMED: SIPI sweep + LAPIC-ID table.
+    Store `ncpu` at boot; every policy below takes it as an input.
+  - per-core utilization counters: busy_tsc, idle_tsc, irq_count, ctx_count
+    (plain per-CPU fields, no locks; merge only when printing)
 Acceptance:
   - boot log lists every core's LAPIC ID and is stable across 20 boots
+  - `qemu -smp 1/2/4` all boot and report the correct `ncpu`
   - `spin 100000000 4` finishes in ~1/4 the time of `spin 100000000 1`
   - 100 % of cores show work in `perf`; idle cores are in `hlt`
+  - utilization shown by `perf` stays within 5 % of `top` on the host
   - no lock is held across an allocation, a fault, or a device wait
 Budget: +4 KiB kernel; 4 KiB per additional core (stack + cpu struct).
 Watch out: AP trampoline must be at a FIXED physical page below 1 MiB;
@@ -226,10 +235,76 @@ Acceptance:
   - no heap allocation after the game starts
   - parallel render: 4 bands on 4 cores >= 3.2x faster than 1 band
   - determinism: same input -> same frame on 1 core and on 4 cores
+  - RESOLUTION INDEPENDENCE: boots and plays at 640x480, 800x600,
+    1024x768 and 1920x1080 with the mode auto-selected from the VBE list
+  - pitch != width*4 is handled (stride from ModeInfoBlock+0x10)
+  - band count follows `ncpu` and actual utilization (see ADAPTIVE POLICY)
 Budget: full-screen clear <= 2 ms, sprite blit <= 1 us per 16x16 sprite.
 Watch out: setting the mode after entering protected mode needs a real-mode
 trampoline (BIOS INT 10h). Either set it in stage2 (preferred, simplest) or
 write the trampoline as an exercise — do not call BIOS from long mode.
+
+---
+
+## ADAPTIVE RESOURCE POLICY
+
+Goal: the OS measures what it has and what it uses, then decides. No magic
+constants, no hardcoded core/screen/RAM numbers.
+
+### 1. Discover cores (dynamic, no assumptions)
+- SIPI to all-except-self, 100 ms timeout, each AP posts LAPIC ID+1 into a
+  table -> `ncpu` and the CPU list. Works with or without ACPI.
+- `qemu -smp N` must give `ncpu == N` for N = 1..8. Test is part of M2B.
+- Later (M11): parse MADT for x2APIC/NUMA; keep the same `ncpu` interface.
+
+### 2. Measure usage (cheap, lock-free)
+Per core: `busy_tsc`, `idle_tsc` (accumulated around `hlt`), `irq_count`,
+`ctx_count`. Utilization = 1 - idle/(busy+idle) over a 100 ms window.
+Cost: two `rdtsc` per idle transition. No sampling thread.
+
+### 3. Decide (with hysteresis - never oscillate)
+| Observed                        | Decision                                   |
+|---------------------------------|--------------------------------------------|
+| N cores idle > 80 % for 500 ms  | stop waking them: leave in `hlt`, bands = k |
+| render frame > 16 ms, cores < N | +1 band per core, up to `ncpu`             |
+| all cores > 90 % for 1 s        | drop resolution scale / detail level       |
+| 1 core busy, rest idle          | keep logic single-threaded, no split       |
+| 2 consecutive changes opposite  | freeze policy for 2 s (damping)            |
+
+Rules: change at most once per 500 ms; prefer fewer bands over more locks;
+log every decision to a ring buffer so `perf` can explain itself.
+
+### 4. Scale RAM (detect, then size)
+- E820 at boot (BIOS INT 15h/0xE820 before leaving real mode) -> RAM map.
+- usable = sum of type-1 regions below 4 GiB, minus 1 MiB, minus kernel.
+- heap = clamp(usable * 3/4, 256 KiB, 64 MiB). Report what was chosen.
+- NO hot-plug, NO shrink. "Scaling" = sizing once from detected memory.
+- display back buffer comes from the heap: need W*H*4 bytes. Rule:
+  if W*H*4 > heap/4, pick the next smaller VBE mode. At 1920x1080 that is
+  8.3 MiB - your "<=256 KiB RAM" budget only holds for text mode; document
+  the real number instead of pretending.
+
+### 5. Scale disk (detect, then size)
+- ATA IDENTIFY: words 60-61 (LBA28) / 100-103 (LBA48) -> total sectors.
+- FS superblock records `total_blocks`; inode/data layout computed from it.
+- no partitions, no resize. If the drive is 64 MiB or 64 GiB the same code
+  works - only the numbers differ.
+
+### 6. Any resolution
+- Enumerate VBE modes (INT 10h AX=4F00 -> controller info, AX=4F01 -> mode
+  info). Filter: graphics, 32 bpp, linear framebuffer, fits in heap rule.
+- Rank: prefer native panel size if known, then 1024x768, then largest that
+  fits. Fallback always 640x480x32.
+- Always use `pitch` (bytes/line) from mode info; never assume width*4.
+- Game logic runs at a fixed LOGICAL resolution (e.g. 320x180); render
+  scales into any physical size with nearest-neighbour + letterbox.
+  -> game code never knows the screen size. This is what makes it portable.
+
+### Acceptance for the whole policy
+- Same image boots at 4 different `-smp` values and 4 resolutions.
+- `perf` prints: ncpu, utilization per core, heap size, disk sectors, mode.
+- Changing `-smp` up must increase measured throughput; changing it down
+  must not crash or hang.
 
 ---
 
