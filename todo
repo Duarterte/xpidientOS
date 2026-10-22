@@ -25,6 +25,9 @@ Nothing after M6 is planned here on purpose.
 | Frame time @1024x768x32 | <= 16.6 ms       | measured per stage, not guessed                 |
 | GPU usage               | 0 driver         | one mode set at boot, then MMIO stores only     |
 | Heap allocations/frame  | 0                | all buffers preallocated at startup             |
+| Cores                   | up to 8          | scales by output region, not by object          |
+| Scaling efficiency      | >= 80 % of N     | N bands on N cores must be >= 0.8N faster       |
+| Lock contention         | < 1 % of runtime | per-CPU data; a global lock on a hot path is a bug |
 
 Rules that deliver the budget:
 - Compile: `-Os -ffreestanding -fno-stack-protector -fno-pic -fno-pie
@@ -50,6 +53,10 @@ Rules that deliver the budget:
 4. Mini-FS layout    — superblock, inode table, data blocks      (M3)
 5. Bytecode ISA      — this is "my assembly", fixed opcodes      (M5)
 6. Driver contract   — probe/init/irq/read/write, no globals     (later)
+7. Per-CPU contract  — per-cpu struct found via GS base; kernel  (M2)
+                       globals are FORBIDDEN, use cpu->field
+8. Partitioning rule — parallel work is split by OUTPUT REGION  (M2B)
+                       (bands/tiles), never by object/entity
 
 ---
 
@@ -65,6 +72,9 @@ Build:
   - GDT: null, 32-bit code, 32-bit data
   - IDT: 256 entries; exceptions 0..31 handled (print name + halt)
   - remap PIC to 0x20..0x2F; mask everything except keyboard (IRQ1)
+    NOTE: the PIC is a stepping stone only. M2B replaces it with the
+    IOAPIC. Keep IRQ handling behind a small layer so both fit:
+    irq_register(n, fn) / irq_ack(n) - never touch 0x20/0x21 outside it.
   - PIT at 100 Hz (used only for the clock; maskable later)
   - PS/2 keyboard driver: IRQ1 -> ring buffer -> key events
   - thin C kernel at 0x10000 called from asm; `puts` in C
@@ -89,13 +99,51 @@ Build:
   - syscall ABI v1: single `int 0x80`-style gate, rax = call number,
     rdi/rsi/rdx = args. Calls: exit, write(console), read(key), tick, mmap.
   - `mem` shell-less debug print: free bytes, used bytes, largest block
+  - SMP-READY STRUCTURE (cheap now, expensive to retrofit):
+      * one `struct cpu` per core, reached via GS base (swapgs on entry)
+      * NO mutable kernel globals. Anything mutable lives in cpu-> or is
+        protected by a spinlock. Enforce by review, not by hope.
+      * ticket spinlock + atomic ops in a tiny atomics.h
+        (lock xchg / lock cmpxchg / lock xadd)
+      * heap: per-CPU bump arena + a global free list only as fallback
+      * scheduler interface takes `struct cpu*` from the start
 Acceptance:
   - kernel runs in long mode, paging on, framebuffer/text still reachable
   - heap survives 10 000 alloc/free pairs with fragmentation reported
   - page fault on a wild pointer prints the address instead of rebooting
+  - SPINLOCK TEST: 100 000 increments from 4 cores -> count == 400 000
 Budget: kernel <= 32 KiB, idle RAM <= 256 KiB.
 Watch out: in long mode there is no `pushad`, `iret` is `iretq`, and GDT
 entries must stay 8-byte aligned. Stack must be 16-byte aligned at calls.
+
+## M2B — MULTICORE BRINGUP
+Goal: all cores awake, each doing work, no locks on the hot path.
+Build:
+  - APIC replaces PIC: LAPIC on (MSR 0x1B: spurious vector + enable),
+    IOAPIC programmed for the keyboard, `sti` per core
+  - AP boot: INIT-SIPI-SIPI (10 ms between), AP wakes in 16-bit real mode
+    at the trampoline page (must be < 1 MiB and identity mapped), switches
+    to protected mode then long mode, reaches `ap_main`, then `sti; hlt`
+  - core discovery WITHOUT ACPI: after SIPI-to-all-except-self (mask
+    0xFF), each AP posts its LAPIC ID (LAPIC+0x20) into a counter table.
+    Timeout 100 ms, take whatever answered. Honest limit: no MADT means
+    no x2APIC and no NUMA - acceptable on QEMU and most desktops.
+  - per-CPU: GDT/TSS per core (needed for ring 3 later and for a real
+    RSP0), LAPIC timer at 100 Hz replaces the global PIT (per-core tick)
+  - TSC sync: measure each core's offset once, pass it to the timer
+  - work model: per-CPU run queue + work-stealing deque
+    (push/pop own, steal from a random other queue, retry twice)
+  - a `spin` command: N bands of a busy loop on N cores
+Acceptance:
+  - boot log lists every core's LAPIC ID and is stable across 20 boots
+  - `spin 100000000 4` finishes in ~1/4 the time of `spin 100000000 1`
+  - 100 % of cores show work in `perf`; idle cores are in `hlt`
+  - no lock is held across an allocation, a fault, or a device wait
+Budget: +4 KiB kernel; 4 KiB per additional core (stack + cpu struct).
+Watch out: AP trampoline must be at a FIXED physical page below 1 MiB;
+write the SIPI vector as (page >> 12). Real mode there has CS=vector<<8.
+Also `wbinvd` and memory barriers after writing the trampoline: the AP
+may start fetching before your stores are visible.
 
 ## M3 — STORAGE + TERMINAL
 Goal: a usable machine. Type commands, read and write files.
@@ -161,12 +209,23 @@ Build:
   - dirty-rect compositor: back buffer + only changed tiles are blitted
   - sprite blitter with clip + palette-free direct RGB
   - engine loop: fixed 60 Hz step, input, update, render, `hlt` between frames
+  - PARALLEL RENDER: split the frame into H horizontal bands, one band per
+    core. Each core owns its band exclusively -> zero locks while blitting.
+    Sync only at frame boundaries with a barrier. Bands align to 8-pixel
+    rows (not cache lines) because we write; false sharing is harmless when
+    bands are >= 64 rows apart.
+  - per-core back buffer SLICES: core k writes rows [k*H/N, (k+1)*H/N),
+    so no two cores ever touch the same cache line of the back buffer.
+  - objects that cross a band boundary are drawn by both neighbours with
+    clipping - cheaper than coordinating ownership.
   - one game, written in my asm, using the ISA from M5
 Acceptance:
   - game at 60 fps, frame time measured and printed by `perf`
   - CPU during gameplay <= 60 % of one core (QEMU)
   - shell and editor still work after quitting the game
   - no heap allocation after the game starts
+  - parallel render: 4 bands on 4 cores >= 3.2x faster than 1 band
+  - determinism: same input -> same frame on 1 core and on 4 cores
 Budget: full-screen clear <= 2 ms, sprite blit <= 1 us per 16x16 sprite.
 Watch out: setting the mode after entering protected mode needs a real-mode
 trampoline (BIOS INT 10h). Either set it in stage2 (preferred, simplest) or
@@ -174,11 +233,30 @@ write the trampoline as an exercise — do not call BIOS from long mode.
 
 ---
 
+## PARALLEL DOCTRINE (read before writing any thread)
+
+1. Parallelise the OUTPUT, not the logic. Framebuffer bands, tile rows,
+   per-core buffers. Game logic stays single-threaded and deterministic
+   until M9 - a race in physics is undebuggable for a solo dev.
+2. No shared mutable state without a lock, and no lock in a per-pixel loop.
+   If you need a lock per pixel, your partitioning is wrong.
+3. Prefer per-CPU over shared: arena, run queue, stat counters, RNG.
+   Merge counters only for display.
+4. Measure scaling, do not assume it. If 4 cores give 2x, the bottleneck is
+   memory bandwidth or a shared lock, not the algorithm.
+5. Amdahl: 10 % serial code caps you at 10x no matter how many cores.
+6. Barriers are expensive. One per frame, not one per object.
+7. TLB shootdown and IPI cost real time; batch them.
+8. Debugging order: run on 1 core first, then 2, then N. If it breaks at 2,
+   it is almost always unsynchronised initialisation, not a data race.
+
+---
+
 ## DO NOT BUILD BEFORE M6
 
-USB, ACPI, SMP, networking, audio, GPU drivers, a C compiler, multitasking,
-processes, virtual memory isolation, filesystems on disk, UEFI, package
-manager, GUI toolkit, multiple games, a debugger.
+USB, ACPI, NUMA, networking, audio, GPU drivers, a C compiler, processes,
+ring-3 isolation, UEFI, package manager, GUI toolkit, multiple games,
+a debugger. (SMP is now IN scope as M2B.)
 Each one is a project. Each one is parked on purpose.
 
 ---
@@ -198,3 +276,4 @@ M7 GPT + own installer (installs on real hardware)
 M8 UEFI loader (installs on any machine)
 M9 JIT: bytecode -> x86_64 native
 M10 audio mixer, second game, self-hosted toolchain
+M11 parallel game logic (deterministic job graph), TLB shootdown, x2APIC/NUMA
