@@ -1,0 +1,27 @@
+Ladder — do these in order
+1. VGA direct write (next, ~20 lines)
+Stop using int 0x10. Write to 0xB8000 yourself: addr = 0xB8000 + (row*80 + col)*2, byte 0 = ASCII, byte 1 = attribute (0x0F = white on black).
+Why: teaches that "printing" is just memory the hardware scans. Also survives leaving real mode. First time you'll need ES.
+
+2. Load a second sector (int 0x13, ah=0x02)
+Move the real code to sector 2 (LBA 1), loaded at 0x1000:0000. Boot sector just loads it and jumps.
+Why: breaks the 512-byte wall. This is the standard stage1 / stage2 split.
+
+3. Make a bootable disk + ISO
+stage1 can't be a bare .bin anymore once you want partitions/GRUB later. Learn dd to a .img and boot with -drive format=raw.
+
+4. Enter protected mode — the big one
+Order inside it matters: cli → load GDT (lgdt) → set CR0.PE → far jmp to 32-bit code → reload all segment registers with selectors → set up a new flat stack.
+Why: 32-bit addressing, no more 64 KB windows, access to >1 MB RAM.
+
+5. IDT + interrupts — remap the PIC to 0x20–0x2F, then int 0x20 becomes your timer. Add a keyboard handler.
+Why: everything async (timers, input, exceptions) depends on this. Your first triple-fault debugging session happens here.
+
+6. Paging
+Identity-map the first 4 MB, enable CR0.PG. Then a bitmap/heap allocator.
+
+7. C kernel — cross-compile i686-elf, link with a custom linker script at 0x100000, call kmain(). From here you can mostly write C.
+
+Two habits that will save you days
+Debug with the log, not your eyes. qemu-system-x86_64 -d int,cpu_reset -D qemu.log — a triple fault prints the interrupt dump here. Or -s -S + gdb -ex "target remote :1234".
+Commit after every working rung. OS dev regressions are brutal; a git init at step 1 pays for itself at step 4.
