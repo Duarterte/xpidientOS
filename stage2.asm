@@ -1,9 +1,9 @@
 [BITS 16]
-[ORG 0x0000]                ; loaded at offset 0 of segment 0x1000
+[ORG 0x7E00]                ; loaded at 0x0000:0x7E00 -> labels ARE physical
 
 start:
     cli
-    mov ax, 0x1000          ; DS must match the LOAD SEGMENT
+    xor ax, ax              ; DS = 0 so DS:offset == physical address
     mov ds, ax
     mov ss, ax
     mov sp, 0x7C00
