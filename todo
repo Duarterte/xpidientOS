@@ -63,6 +63,9 @@ Rules that deliver the budget:
                        globals are FORBIDDEN, use cpu->field
 8. Partitioning rule — parallel work is split by OUTPUT REGION  (M2B)
                        (bands/tiles), never by object/entity
+9. Kernel image      — linked at 0x100000, flat binary, entry at the  (M2)
+                       first byte, loaded from a FROZEN LBA (64), max
+                       64 KiB until the loader learns chunked reads
 
 ---
 
@@ -71,64 +74,129 @@ Goal: prove the boot chain works.
 Built: stage1 (512 B) -> int 0x13 -> stage2 -> VGA text via 0xB8000 + cursor.
 Acceptance: green text on screen, 55 AA signature, image builds via make.
 
-## M1 — CPU CONTROL (32-bit protected mode — deliberate stepping stone)
+## M1 — CPU CONTROL (32-bit protected mode)  [DONE 1.1-1.5]
 Goal: own the CPU. No BIOS after this point.
 Why 32-bit first: long mode REQUIRES paging on before the first 64-bit
-instruction, so if you go straight to 64-bit you must write page tables
-with no working console. M1 gives you a faulting, printing, interrupt-driven
-machine in ~2 days; then M2 spends one milestone on paging only.
-Everything here transfers to 64-bit except: IDT gate format (16 B), iretq,
-and no pushad.
-Build:
-  - protected mode switch in stage2 (cli -> A20 -> lgdt -> CR0.PE -> far jmp)
-  - GDT: null, 32-bit code, 32-bit data
-  - IDT: 256 entries; exceptions 0..31 handled (print name + halt)
-  - remap PIC to 0x20..0x2F; mask everything except keyboard (IRQ1)
-    NOTE: the PIC is a stepping stone only. M2B replaces it with the
-    IOAPIC. Keep IRQ handling behind a small layer so both fit:
-    irq_register(n, fn) / irq_ack(n) - never touch 0x20/0x21 outside it.
-  - PIT at 100 Hz (used only for the clock; maskable later)
-  - PS/2 keyboard driver: IRQ1 -> ring buffer -> key events
-  - thin C kernel at 0x10000 called from asm; `puts` in C
-  - idle loop is `hlt`
-Acceptance:
-  - typing echoes on screen via IRQ, not polling
-  - `perf` shows idle CPU near 0 % (QEMU monitor `info cpus` steady)
-  - divide-by-zero and invalid-opcode print their name and halt cleanly
-Budget: kernel <= 16 KiB here.
-Watch out: IDT gates need the right DPL and a 32-bit far return (`iret`),
-and every ISR must `cld` + save/restore the right registers.
+instruction, so if you went straight to 64-bit you would have to write page
+tables with no working console. That trade is now paid off - M1 gave a
+printing, faulting, interrupt-driven machine, so M2 can spend all its
+effort on long mode + C.
+Built:
+  - stage2 relocated to 0x7E00, ORG 0x7E00, DS=0 (labels ARE physical)
+  - stage1 reads 8 sectors (4 KiB of stage2)
+  - GDT: null, 32-bit code (0x9A/0xCF), data (0x92/0xCF)
+  - PM switch: cli -> A20(0x92) -> lgdt -> CR0.PE -> far jmp dword
+  - IDT: 256 gates, all -> isr_default, vector 0 -> isr0 (#DE verified)
+  - PIC remapped to 0x20..0x2F, only IRQ0 unmasked
+  - PIT ch0 mode 3, divisor 11931 -> VERIFIED 100 ticks/s
+  - hlt idle loop; print_u32 decimal writer
+LESSON (cost 3 bugs): AX == AH:AL and EAX contains AX. Writing AH destroys
+the low half of EAX. Never set AH between "load value" and "print value".
 
-## M2 — LONG MODE (x86_64) + MEMORY + ABIs
-Goal: native 64-bit, real memory management, freeze the OS personality.
-THE HARD FACT: long mode cannot be entered without paging enabled, so page
-tables come BEFORE the first 64-bit instruction. That is why M1 exists.
+### M1.6 — KEYBOARD  -> DEFERRED to M2.5
+Ports 0x60 (data) / 0x64 (status) are mode-independent, so this step loses
+nothing by moving after long mode. Doing it later keeps M2's momentum.
 
-Build (this ORDER is mandatory, every step makes the next legal):
+## M2 — LONG MODE + C KERNEL  (the current milestone)
+Goal: run C, compiled by a real compiler, natively in 64-bit.
+This is THE milestone that changes the project from "asm demo" to "OS".
+
+### M2.0 — TOOLCHAIN (already verified on this machine)
+Installed: gcc 15.2, GNU ld, objcopy, nasm. No clang, no lld, no
+x86_64-elf-gcc - and NONE ARE NEEDED. Host gcc cross-compiles fine because
+x86_64 IS the host architecture:
+    gcc -m64 -ffreestanding -fno-pie -no-pie -fno-stack-protector \
+        -mno-red-zone -mno-sse -mno-mmx -Os -c file.c -o file.o
+    ld -m elf_x86_64 -T kernel.ld -nostdlib -o kernel.elf file.o
+    objcopy -O binary kernel.elf kernel.bin
+Rules that make this work:
+  - -fno-pie -no-pie   Ubuntu gcc defaults to PIE -> GOT/PLT -> unresolvable
+  - -mno-red-zone      interrupts clobber the 128-byte red zone
+  - -mno-sse/-mno-mmx  no FPU state to save; use fixed-point
+  - -nostdlib          no CRT, no _start from libc
+  - provide memcpy/memset/memmove yourself: struct copy and array init
+    may EMIT CALLS to them even in -ffreestanding code
+  - .bss is NOT in the flat binary (objcopy skips NOBITS). Zero .bss in
+    asm before calling kmain, or make the linker script place it and
+    memset it: __bss_start .. __bss_end symbols from the script.
+
+### M2.1 — PAGE TABLES + ENTER LONG MODE  (in stage2, still real mode)
+Order is mandatory, each step makes the next legal:
    1. CPUID 0x80000001 EDX bit 29 = LM. If 0 -> print and halt.
-      Also read: 0x80000008 -> physical/virtual address widths,
-                 0x80000001 EDX bit 26 = 1 GiB pages (PDPE1GB),
-                 0x80000001 EDX bit 20 = NX support.
-   2. build page tables, identity mapping physical 0..4 GiB at virtual 0..4 GiB:
-      preferred: 1 GiB pages -> 1 PML4 + 1 PDPT (4 entries) = 8 KiB
-      fallback:  2 MiB pages -> PML4 + PDPT + 4 PDs        = 24 KiB
-      table flags: PML4[0]=P|RW, PDPT entry=P|RW|PS (bit7), etc.
-   3. GDT with FOUR entries: null, 64-bit code (L=1,D=0), data, TSS
-   4. mov cr3, <physical addr of PML4>   (CR3 is physical - no translation)
-   5. mov cr4: set PAE (bit 5).             <- long mode IS a PAE extension
-   6. IA32_EFER (MSR 0xC0000080): set LME (bit 8) and NXE (bit 11)
-   7. mov cr0: set PG (bit 31) AND PE (bit 0). Long mode activates only
-      when BOTH are set. LME alone = still 32-bit with PAE paging.
-   8. far jmp to selector 0x08 with a 64-bit (dword/QWORD) target
-   9. reload DS/ES/FS/GS/SS, set RSP, then [BITS 64]
-  10. verify EFER.LMA (bit 10) == 1 - if not, you are not in long mode.
+      Also read: 0x80000008 -> physical/virtual widths,
+                 0x80000001 EDX bit 26 = 1 GiB pages, bit 20 = NX.
+   2. build tables, identity map phys 0..4 GiB at virt 0..4 GiB:
+      preferred: 1 GiB pages -> PML4 + PDPT (4 entries) = 8 KiB
+      fallback:  2 MiB pages -> PML4 + PDPT + 4 PDs       = 24 KiB
+   3. GDT: null, 64-bit code (L=1,D=0 -> 0x00AF9A000000FFFF), data, TSS
+   4. mov cr3, <physical addr of PML4>   (CR3 is physical)
+   5. CR4.PAE = 1 (bit 5)                <- long mode IS a PAE extension
+   6. IA32_EFER (MSR 0xC0000080): LME (bit 8) | NXE (bit 11)
+   7. CR0.PG (31) | CR0.PE (0)           <- long mode activates only with BOTH
+   8. far jmp to selector 0x08 with a 64-bit target
+   9. reload DS/ES/FS/GS/SS, set RSP, [BITS 64]
+  10. verify EFER.LMA (bit 10) == 1, else halt with a message
 
-After the switch:
-  - SSE enable if the renderer will use it: CR4.OSFXSR (9) | CR4.OSXMMEXCPT
-    (10), then `finit`, and one 512-byte FXSAVE area per CPU (16-B aligned).
-    Until then every SSE instruction #UDs (BIOS does not guarantee it's on).
+### M2.2 — C KERNEL AS A FLAT BINARY
+Decision: the kernel is NOT relocatable. It is linked at a fixed physical
+address and loaded there. No ELF parsing, no relocations, no paging games.
+
+kernel.ld (the whole layout):
+    ENTRY(_start)
+    SECTIONS {
+      . = 0x100000;                      /* 1 MiB - above stage2 and VGA */
+      .text   : { *(.text*) }
+      .rodata : { *(.rodata*) }
+      .data   : { *(.data*) }
+      .bss    : { __bss_start = .; *(COMMON) *(.bss*) __bss_end = .; }
+    }
+Why 1 MiB: 0x0-0xA0000 is BIOS/low memory, 0xA0000-0x100000 is video ROM.
+Nothing of yours lives there. 0x100000 is the traditional kernel base.
+NOT higher-half yet: that needs -mcmodel=kernel + a VMA!=LMA script.
+Do it at M7 when user space appears, not now.
+
+_start (asm, [BITS 64]) must do, in this order:
+    - mov rsp, stack_top        (16-byte aligned, .bss or a reserved area)
+    - zero __bss_start..__bss_end   (objcopy does NOT emit .bss bytes)
+    - call kmain
+    - cli / hlt loop if kmain returns
+
+### M2.3 — LOAD THE KERNEL FROM DISK
+stage1 currently reads 8 sectors = 4 KiB of stage2. Keep it at 8.
+stage2 then loads the kernel - and CHS is the wrong tool for that:
+  - use int 0x13 AH=0x42 (extended read, LBA28/48) with a Disk Address
+    Packet (16 bytes, 16-byte aligned):
+        +0 size=16 (byte)  +1 reserved=0
+        +2 count (word)    +4 buf offset (word)  +6 buf segment (word)
+        +8 LBA low  (qword)
+   16-bit real mode still has 32-bit regs: use ESI/EDI in the DAP build.
+  - kernel LBA: decide once and freeze it. Recommended: put the kernel
+    at a fixed LBA, e.g. LBA 64 (32 KiB in), and pad the image so nothing
+    else occupies it. Freeze this number - it is a FROZEN CONTRACT.
+  - destination 0x100000 in real mode needs segment 0xFFFF + offset 0x10
+    (= 0x100000). The buffer must not cross a 64 KiB boundary, so read in
+    chunks of <= 64 KiB - 0x10 and bump the segment each chunk.
+  - check CF after every read; retry 3x with AH=0 (reset) before giving up.
+
+### M2.4 — THE HANDOFF
+    real mode: load kernel -> build page tables -> enter long mode
+    long mode: jmp 0x100000 (or call it; it never returns)
+Acceptance: kmain prints "hello from C in long mode" and the tick counter
+still advances - which proves interrupts survived the mode switch.
+
+### M2.5 — KEYBOARD (deferred from M1.6, now in 64-bit)
+Unmask IRQ1 (master mask 0xFC), gate 0x21 -> isr_kbd, and:
+    in al, 0x60        ; MUST read or the controller stalls forever
+    ring buffer push   ; head written only by the IRQ, tail only by main loop
+    EOI to 0x20
+Scancode set 1: make = press, break = press|0x80. 0x1C=Enter 0x0E=BS
+0x2A=LShift 0x39=Space.
+In 64-bit the stub must save ALL caller-clobbered regs it uses; there is
+no pushad, and iretq pops RIP/CS/RFLAGS/RSP/SS.
+
+### M2.6 — MEMORY + ABIs
   - static arena from the linker end symbol to a fixed ceiling
-  - bitmap heap on top of the arena (4 KiB blocks), debug checks in dev builds
+  - bitmap heap on top of the arena (4 KiB blocks), debug checks in dev
   - page fault handler: print CR2 + decoded error bits (P/W/U/RSVD/I-D/PK)
     and RIP, then halt. Decoding the bits is the whole learning value.
   - NX enforcement: heap, stack and VM memory NX; code executable.
@@ -143,7 +211,7 @@ After the switch:
       switch stacks - the entry stub must set RSP from the per-CPU struct.
       SYSRET does not restore RSP, and #GPs in ring 0 if RCX is not
       canonical. Both traps are mandatory tests.
-  - `mem` shell-less debug print: free bytes, used bytes, largest block
+  - `mem` debug print: free bytes, used bytes, largest block
   - SMP-READY STRUCTURE (cheap now, expensive to retrofit):
       * segmentation is DEAD in 64-bit: base and limit are ignored for
         DS/ES/SS. The only per-CPU pointers are the FS_BASE (0xC0000100)
@@ -155,10 +223,29 @@ After the switch:
       * heap: per-CPU bump arena + a global free list only as fallback
       * scheduler interface takes `struct cpu*` from the start
 
+### C KERNEL vs C PROGRAM (know the difference now, build it in this order)
+KERNEL (M2): one flat binary, linked at 0x100000, loaded there, trusts
+itself. No relocations, no ELF, no isolation. This is why it is fast to
+build: zero loader complexity.
+PROGRAM (M3+): a real executable needs
+  - a format (magic + sections + entry + imports): our own ELF-like header
+  - a loader that reads it, copies each section to a DIFFERENT address
+  - either position-independent code or a relocation pass
+  - its own stack and (later) its own page tables for isolation
+  - a syscall path to reach the kernel
+Do NOT conflate them. "Run compiled C" happens at M2 for the kernel; "run
+compiled C programs" happens at M3 with the executable format contract.
+Note: freestanding C still needs you to provide memcpy/memset/memmove -
+gcc emits calls to them for struct assignment and large array init, even
+with -ffreestanding and -nostdlib.
+
 Acceptance:
+  - kmain (C, compiled by gcc) prints "hello from C in long mode"
   - EFER.LMA == 1 after the switch (proves long mode, not wishful thinking)
-  - a test that uses r8..r15 and 64-bit registers passes
-  - paging on, framebuffer/text still reachable, identity map correct
+  - the 100 Hz tick counter still advances after the switch -> interrupts
+    and the PIC survived
+  - a C function using r8..r15 and 64-bit arguments returns correct results
+  - paging on, VGA text still reachable, identity map correct
   - heap survives 10 000 alloc/free pairs with fragmentation reported
   - wild pointer -> #PF handler prints CR2 + decoded error bits
   - non-canonical pointer -> #GP handler prints RIP, no reboot
