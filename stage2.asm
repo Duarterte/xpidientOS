@@ -62,20 +62,27 @@ pm32:
     mov esp, 0x90000         ; new stack, below VGA at 0xA0000
 
     call idt_setup           ; build 256 gates, then lidt
+    call pic_remap           ; IRQ0..15 -> vectors 0x20..0x2F
+    call pit_init            ; channel 0 at 100 Hz
 
     mov esi, pm_msg
     mov edi, 0xB8000 + 320   ; row 2, keeps row 0 visible
     mov ah, 0x0F             ; white on black
     call puts32
 
-    xor eax, eax
-    xor ecx, ecx
-    div ecx                  ; #DE -> vector 0, transfer to isr0
+    mov esi, msg_timer
+    mov edi, 0xB8000 + 640   ; row 4
+    mov ah, 0x0E             ; yellow
+    call puts32
 
-.hang:                       ; only reached if #DE somehow returns
-    cli
-    hlt
-    jmp .hang
+    sti                      ; IDT + PIC are valid now, safe to enable
+    mov byte [cur_attr], 0x0E      ; yellow, set ONCE - not inside the loop
+.loop:
+    mov eax, [tick]
+    mov edi, 0xB8000 + 640 + 7*2   ; just after "Timer: "
+    call print_u32
+    hlt                      ; sleep until the next timer interrupt
+    jmp .loop
 
 ; ---------------------------------------------------------------------------
 ; puts32 - 32-bit VGA writer
@@ -120,8 +127,104 @@ idt_setup:
     shr eax, 16
     mov [edi+6], ax
 
+    mov edi, idt_table + 0x20*8   ; vector 0x20 -> timer (IRQ0 after remap)
+    mov eax, isr_timer
+    mov [edi], ax
+    shr eax, 16
+    mov [edi+6], ax
+
     lidt [idtr]
     ret
+
+; ---------------------------------------------------------------------------
+; print_u32 - write EAX as unsigned decimal to ES:DI
+;   in:  EAX = value, EDI = VGA offset
+;        attribute taken from [cur_attr]  <- NOT from AH, because AH is part
+;        of EAX and would corrupt the value being printed.
+;   out: EDI advanced
+;   clobbers: EAX, EBX, ECX, EDX
+; ---------------------------------------------------------------------------
+print_u32:
+    push ebx
+    push ecx
+    push edx
+    mov ecx, 10              ; divisor
+    xor ebx, ebx             ; BL = digit count
+    mov bh, [cur_attr]       ; BH = attribute (survives div)
+.digits:
+    xor edx, edx
+    div ecx                  ; EAX = quotient, EDX = remainder
+    add dl, '0'
+    push edx                 ; digits come out reversed
+    inc bl
+    test eax, eax
+    jnz .digits
+.print:
+    pop edx
+    mov al, dl
+    mov ah, bh
+    stosw
+    dec bl
+    jnz .print
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; ---------------------------------------------------------------------------
+; pic_remap - move hardware IRQs off the CPU exception vectors
+;   Without this, IRQ0 (timer) arrives on vector 0x08 = #DF = triple fault.
+; ---------------------------------------------------------------------------
+pic_remap:
+    mov al, 0x11
+    out 0x20, al             ; ICW1 master: init, ICW4 will follow
+    out 0xA0, al             ; ICW1 slave
+
+    mov al, 0x20
+    out 0x21, al             ; ICW2 master: IRQ0..7  -> 0x20..0x27
+    mov al, 0x28
+    out 0xA1, al             ; ICW2 slave : IRQ8..15 -> 0x28..0x2F
+
+    mov al, 0x04
+    out 0x21, al             ; ICW3 master: slave is on IRQ2
+    mov al, 0x02
+    out 0xA1, al             ; ICW3 slave : cascade identity 2
+
+    mov al, 0x01
+    out 0x21, al             ; ICW4: 8086 mode
+    out 0xA1, al
+
+    mov al, 0xFE
+    out 0x21, al             ; mask everything except IRQ0 (timer)
+    mov al, 0xFF
+    out 0xA1, al             ; slave fully masked
+    ret
+
+; ---------------------------------------------------------------------------
+; pit_init - channel 0, mode 3, 100 Hz
+;   1193182 / 100 = 11931 = 0x2E9B
+; ---------------------------------------------------------------------------
+pit_init:
+    mov al, 0x36             ; ch0, lobyte/hibyte, mode 3, binary
+    out 0x43, al
+    mov ax, 11931
+    out 0x40, al             ; low byte first
+    mov al, ah
+    out 0x40, al             ; then high byte
+    ret
+
+; ---------------------------------------------------------------------------
+; isr_timer - IRQ0, vector 0x20. MUST return, MUST send EOI.
+;   No EOI  -> the PIC never delivers IRQ0 again (one tick, then silence).
+;   No iret -> the main loop never resumes.
+; ---------------------------------------------------------------------------
+isr_timer:
+    push eax
+    inc dword [tick]
+    mov al, 0x20
+    out 0x20, al             ; EOI to the master PIC
+    pop eax
+    iret
 
 ; ---------------------------------------------------------------------------
 ; isr0 - vector 0, divide error. The CPU pushes EIP, CS, EFLAGS - NO error
@@ -149,9 +252,13 @@ isr_default:
     hlt
     jmp .h
 
-pm_msg:  db "Protected mode: 32-bit!", 0
-msg_de:  db "EXCEPTION 0: divide error caught", 0
-msg_unk: db "EXCEPTION: unexpected vector", 0
+pm_msg:   db "Protected mode: 32-bit!", 0
+msg_de:   db "EXCEPTION 0: divide error caught", 0
+msg_unk:  db "EXCEPTION: unexpected vector", 0
+msg_timer: db "Timer: ", 0
+
+tick: dd 0                   ; incremented by isr_timer at 100 Hz
+cur_attr: db 0x0F            ; current VGA attribute for print_u32
 
 align 8
 idt_table:
