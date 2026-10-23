@@ -20,8 +20,139 @@ start:
     mov ah, 0x0A            ; light green on black
     call puts
     call sync_cursor        ; hardware cursor follows the text
-    call halt
+    cli
+    in al, 0x92
+    or al, 2
+    out 0x92, al             ; A20 gate
 
+    lgdt [gdtr]
+    mov eax, cr0
+    or eax, 1
+    mov cr0, eax             ; CR0.PE
+    jmp dword 0x08:pm32      ; far jump - no return
+
+; ---- 16-bit data: never executed, only read ----
 msg: db "Stage 2 loaded!", 0
 
-%include "lib.asm"
+gdt:
+    dq 0x0000000000000000    ; 0x00 null descriptor (required)
+    dq 0x00CF9A000000FFFF    ; 0x08 code: base 0, 4 GiB, 32-bit, readable
+    dq 0x00CF92000000FFFF    ; 0x10 data: base 0, 4 GiB, writable
+gdt_end:
+
+gdtr:
+    dw gdt_end - gdt - 1     ; limit = size - 1
+    dd gdt                   ; linear base (physical, thanks to ORG 0x7E00)
+
+idtr:
+    dw 256*8 - 1             ; limit = 256 gates * 8 bytes - 1
+    dd idt_table             ; linear base (physical, thanks to ORG 0x7E00)
+
+%include "lib.asm"           ; MUST stay in the [BITS 16] region
+
+; ---- 32-bit code ----
+[BITS 32]
+pm32:
+    mov ax, 0x10             ; data selector - reload ALL of them
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    mov esp, 0x90000         ; new stack, below VGA at 0xA0000
+
+    call idt_setup           ; build 256 gates, then lidt
+
+    mov esi, pm_msg
+    mov edi, 0xB8000 + 320   ; row 2, keeps row 0 visible
+    mov ah, 0x0F             ; white on black
+    call puts32
+
+    xor eax, eax
+    xor ecx, ecx
+    div ecx                  ; #DE -> vector 0, transfer to isr0
+
+.hang:                       ; only reached if #DE somehow returns
+    cli
+    hlt
+    jmp .hang
+
+; ---------------------------------------------------------------------------
+; puts32 - 32-bit VGA writer
+;   in:  ESI = string, EDI = 0xB8000 ofs, AH = attribute
+;   out: EDI advanced past the text
+;   clobbers: EAX, ESI, EDI   (DS must have base 0)
+; ---------------------------------------------------------------------------
+puts32:
+    lodsb
+    test al, al
+    jz .done
+    stosw
+    jmp puts32
+.done:
+    ret
+
+; ---------------------------------------------------------------------------
+; idt_setup - fill all 256 gates with isr_default, then vector 0 = isr0
+;   Every gate is 8 bytes:
+;     +0 offset 15:0 | +2 CS | +4 zero | +5 type_attr | +6 offset 31:16
+;   type_attr 0x8E = present, DPL 0, 32-bit INTERRUPT gate (clears IF)
+; ---------------------------------------------------------------------------
+idt_setup:
+    mov edi, idt_table
+    mov ecx, 256
+    mov ebx, isr_default
+.fill:
+    mov eax, ebx
+    mov [edi], ax            ; offset 15:0
+    mov word [edi+2], 0x08   ; CS = code selector from the GDT
+    mov byte [edi+4], 0      ; reserved, must be 0
+    mov byte [edi+5], 0x8E   ; P=1 DPL=0 gate-type=0xE
+    shr eax, 16
+    mov [edi+6], ax          ; offset 31:16
+    add edi, 8
+    dec ecx
+    jnz .fill
+
+    mov edi, idt_table       ; vector 0 -> divide error handler
+    mov eax, isr0
+    mov [edi], ax
+    shr eax, 16
+    mov [edi+6], ax
+
+    lidt [idtr]
+    ret
+
+; ---------------------------------------------------------------------------
+; isr0 - vector 0, divide error. The CPU pushes EIP, CS, EFLAGS - NO error
+;        code. We do not return: halt and let the screen keep the evidence.
+; ---------------------------------------------------------------------------
+isr0:
+    mov esi, msg_de
+    mov edi, 0xB8000 + 480   ; row 3 - row 2 holds the PM message
+    mov ah, 0x0C             ; light red
+    call puts32
+.h: cli
+    hlt
+    jmp .h
+
+; ---------------------------------------------------------------------------
+; isr_default - every other vector. Pushed frame differs per vector
+;               (some push an error code) - which is why we never iret here.
+; ---------------------------------------------------------------------------
+isr_default:
+    mov esi, msg_unk
+    mov edi, 0xB8000 + 320
+    mov ah, 0x0E             ; yellow
+    call puts32
+.h: cli
+    hlt
+    jmp .h
+
+pm_msg:  db "Protected mode: 32-bit!", 0
+msg_de:  db "EXCEPTION 0: divide error caught", 0
+msg_unk: db "EXCEPTION: unexpected vector", 0
+
+align 8
+idt_table:
+    times 256*8 db 0         ; 2048 bytes, filled at runtime by idt_setup
