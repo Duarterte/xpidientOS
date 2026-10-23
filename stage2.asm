@@ -38,6 +38,7 @@ gdt:
     dq 0x0000000000000000    ; 0x00 null descriptor (required)
     dq 0x00CF9A000000FFFF    ; 0x08 code: base 0, 4 GiB, 32-bit, readable
     dq 0x00CF92000000FFFF    ; 0x10 data: base 0, 4 GiB, writable
+    dq 0x00AF9A000000FFFF    ; 0x18 0x18 code 64-bit
 gdt_end:
 
 gdtr:
@@ -70,19 +71,15 @@ pm32:
     mov ah, 0x0F             ; white on black
     call puts32
 
-    mov esi, msg_timer
-    mov edi, 0xB8000 + 640   ; row 4
-    mov ah, 0x0E             ; yellow
-    call puts32
-
-    sti                      ; IDT + PIC are valid now, safe to enable
-    mov byte [cur_attr], 0x0E      ; yellow, set ONCE - not inside the loop
-.loop:
-    mov eax, [tick]
-    mov edi, 0xB8000 + 640 + 7*2   ; just after "Timer: "
-    call print_u32
-    hlt                      ; sleep until the next timer interrupt
-    jmp .loop
+    ; ---- M2.1: go to long mode ----
+    ; No timer loop here any more: IRQs stay off because the 8-byte IDT
+    ; gates used above are invalid in 64-bit mode. Interrupts return in M2.6
+    ; with 16-byte gates.
+    cli
+    call build_pagetables
+    call enter_long          ; never returns
+.h: hlt
+    jmp .h
 
 ; ---------------------------------------------------------------------------
 ; puts32 - 32-bit VGA writer
@@ -252,10 +249,97 @@ isr_default:
     hlt
     jmp .h
 
+build_pagetables:
+    push eax
+    push ecx
+    push edi
+
+    ; zero 24 KiB so every unused entry reads as "not present"
+    mov edi, 0x20000
+    mov ecx, 0x6000/4
+    xor eax, eax
+    rep stosd
+
+    ; PML4[0] -> PDPT
+    mov dword [0x20000], 0x21000 | 3     ; present | writable
+
+    ; PDPT[0..3] -> four PD pages (each PD covers 1 GiB)
+    mov dword [0x21000 + 0*8], 0x22000 | 3
+    mov dword [0x21000 + 1*8], 0x23000 | 3
+    mov dword [0x21000 + 2*8], 0x24000 | 3
+    mov dword [0x21000 + 3*8], 0x25000 | 3
+
+    ; 2048 PD entries -> 2048 x 2 MiB = 4 GiB, identity mapped
+    ; flags 0x83 = present | writable | PS (huge page, no PT below)
+    ; FIRST entry MUST map physical 0, so it starts at 0x83, not 0x200083
+    mov edi, 0x22000
+    mov eax, 0x000000 | 0x83
+    mov ecx, 2048
+.fill:
+    mov [edi], eax
+    add eax, 0x200000
+    add edi, 8
+    dec ecx
+    jnz .fill
+
+    pop edi
+    pop ecx
+    pop eax
+    ret
+
+; ---------------------------------------------------------------------------
+; enter_long - 32-bit protected mode -> IA-32e (long mode)
+;   Every step is required and the order cannot change.
+; ---------------------------------------------------------------------------
+enter_long:
+    ; 1. does this CPU even have long mode?
+    mov eax, 0x80000000
+    cpuid
+    cmp eax, 0x80000001
+    jb .no_lm
+    mov eax, 0x80000001
+    cpuid
+    test edx, 1 << 29                ; EDX bit 29 = LM
+    jz .no_lm
+
+    ; 2. PML4 physical address into CR3
+    mov eax, 0x20000
+    mov cr3, eax
+
+    ; 3. PAE - long mode is a PAE extension, not an alternative
+    mov eax, cr4
+    or eax, 1 << 5                   ; CR4.PAE
+    mov cr4, eax
+
+    ; 4. EFER: LME arms long mode, NXE enables the NX page bit
+    mov ecx, 0xC0000080              ; IA32_EFER
+    rdmsr
+    or eax, (1 << 8) | (1 << 11)     ; LME | NXE
+    xor edx, edx                     ; clear high bits from firmware
+    wrmsr
+
+    ; 5. PG + PE together activate long mode (LME alone does nothing)
+    mov eax, cr0
+    or eax, 0x80000001               ; CR0.PG | CR0.PE
+    mov cr0, eax
+
+    ; 6. far jump - validates CS against the L=1 descriptor
+    jmp 0x18:pm64
+
+.no_lm:
+    mov esi, msg_nolm
+    mov edi, 0xB8000 + 800
+    mov ah, 0x0C
+    call puts32
+    cli
+.h: hlt
+    jmp .h
+
 pm_msg:   db "Protected mode: 32-bit!", 0
 msg_de:   db "EXCEPTION 0: divide error caught", 0
 msg_unk:  db "EXCEPTION: unexpected vector", 0
 msg_timer: db "Timer: ", 0
+msg_nolm: db "CPU has no long mode - halting", 0
 
 tick: dd 0                   ; incremented by isr_timer at 100 Hz
 cur_attr: db 0x0F            ; current VGA attribute for print_u32
@@ -263,3 +347,34 @@ cur_attr: db 0x0F            ; current VGA attribute for print_u32
 align 8
 idt_table:
     times 256*8 db 0         ; 2048 bytes, filled at runtime by idt_setup
+
+; ---- 64-bit code ----
+[BITS 64]
+pm64:
+    mov ax, 0x10                   ; data selector (validated, then ignored)
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    mov rsp, 0x90000               ; 16-byte aligned
+
+    mov rsi, msg64
+    mov rdi, 0xB8000 + 800         ; row 5
+    mov ah, 0x0B                   ; light cyan
+    call puts64
+
+.h: cli
+    hlt
+    jmp .h
+
+puts64:
+    lodsb                          ; AL = [RSI], RSI++
+    test al, al
+    jz .done
+    stosw                          ; [RDI] = AX, RDI += 2
+    jmp puts64
+.done:
+    ret
+
+msg64: db "LONG MODE: 64-bit, 16 registers!", 0
