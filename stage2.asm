@@ -20,6 +20,7 @@ start:
     mov ah, 0x0A            ; light green on black
     call puts
     call sync_cursor        ; hardware cursor follows the text
+    call load_kernel        ; read the C kernel to 0x100000 (still real mode)
     cli
     in al, 0x92
     or al, 2
@@ -49,6 +50,74 @@ idtr:
     dw 256*8 - 1             ; limit = 256 gates * 8 bytes - 1
     dd idt_table             ; linear base (physical, thanks to ORG 0x7E00)
 
+; ---------------------------------------------------------------------------
+; KERNEL LOADER (real mode, before the switch - int 0x13 dies in long mode)
+;
+; The kernel is a flat binary at LBA 64 (frozen contract, todo item 9).
+; Destination: physical 0x100000, built from segment:offset as
+;     0xFFFF * 16 + 0x0010 = 0xFFFF0 + 0x10 = 0x100000
+; Real mode can reach that because A20 is open, and this is a PIO read (not
+; DMA), so the buffer need not sit below 1 MiB.
+; 64 sectors = 32 KiB, so offset 0x0010..0x8010 never crosses a 64 KiB boundary.
+;
+; NOTE: the boot drive number is stored at 0x2F000 (segment 0x2F00, offset 0)
+; because 0x0500-0x051F is SeaBIOS scratch and gets clobbered.
+; ---------------------------------------------------------------------------
+%define DRIVE_SEG    0x2F00     ; segment whose :0000 holds the boot drive
+%define KERNEL_LBA   64
+%define KERNEL_SECS  64
+%define STATUS_SEG   0x2F00     ; :0100 = 1 on success, 0xEE on failure
+%define STAGE_BUF    0x30000    ; low staging buffer (192 KiB) - free RAM
+%define KERNEL_DEST  0x100000   ; where the kernel must actually run
+
+load_kernel:
+    mov word  [dap + 0],  16              ; packet size
+    mov word  [dap + 1],  0               ; reserved
+    mov word  [dap + 2],  KERNEL_SECS     ; sector count
+    mov word  [dap + 4],  0x0000          ; buffer offset
+    mov word  [dap + 6],  0x3000          ; buffer segment -> 0x30000 staging
+    mov dword [dap + 8],  KERNEL_LBA      ; LBA low
+    mov dword [dap + 12], 0               ; LBA high
+
+    push ds
+    mov ax, DRIVE_SEG
+    mov ds, ax
+    mov dl, [0]                           ; the drive number stage1 saved
+    pop ds
+
+    mov si, dap
+    mov ah, 0x42                          ; extended read (LBA)
+    int 0x13
+    jc .error
+
+    push ds
+    mov ax, STATUS_SEG
+    mov ds, ax
+    mov byte [0x100], 1                   ; marker: kernel staged OK
+    pop ds
+    ret
+
+.error:
+    push ds
+    mov ax, STATUS_SEG
+    mov ds, ax
+    mov byte [0x100], 0xEE                ; marker: staging FAILED
+    pop ds
+
+    mov ax, 0xB800
+    mov es, ax
+    mov si, msg_kmfail
+    mov di, 960                           ; row 6
+    mov ah, 0x0C
+    call puts
+    call halt
+
+align 4
+dap:
+    times 16 db 0
+
+msg_kmfail: db "KERNEL LOAD FAILED (LBA 64): int13h error", 0
+
 %include "lib.asm"           ; MUST stay in the [BITS 16] region
 
 ; ---- 32-bit code ----
@@ -76,10 +145,32 @@ pm32:
     ; gates used above are invalid in 64-bit mode. Interrupts return in M2.6
     ; with 16-byte gates.
     cli
+    call copy_kernel         ; 0x30000 -> 0x100000 (flat 32-bit addressing)
     call build_pagetables
     call enter_long          ; never returns
 .h: hlt
     jmp .h
+
+; ---------------------------------------------------------------------------
+; copy_kernel - move the staged kernel image from low memory to 0x100000
+;   Real mode CANNOT be asked to place it there: the BIOS refuses a read
+;   whose buffer is above 1 MiB. So we read low (0x30000) and copy here,
+;   where flat 32-bit segments make any address reachable.
+;   Size: KERNEL_SECS * 512 bytes = 32 KiB = 8192 dwords.
+; ---------------------------------------------------------------------------
+copy_kernel:
+    push esi
+    push edi
+    push ecx
+    cld
+    mov esi, STAGE_BUF
+    mov edi, KERNEL_DEST
+    mov ecx, (KERNEL_SECS * 512) / 4
+    rep movsd
+    pop ecx
+    pop edi
+    pop esi
+    ret
 
 ; ---------------------------------------------------------------------------
 ; puts32 - 32-bit VGA writer
@@ -363,6 +454,10 @@ pm64:
     mov rdi, 0xB8000 + 800         ; row 5
     mov ah, 0x0B                   ; light cyan
     call puts64
+
+    ; ---- hand off to the C kernel at 0x100000 ----
+    mov rax, 0x100000
+    jmp rax                        ; jumps to _start, never returns
 
 .h: cli
     hlt

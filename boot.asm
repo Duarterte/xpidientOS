@@ -13,6 +13,9 @@ main:
     cld
 
     mov [boot_drive], dl    ; BIOS passes boot drive in DL - save it NOW
+    mov ax, 0x2F00          ; also publish it at 0x2F000 for stage2:
+    mov es, ax              ;   0x0500-0x051F is SeaBIOS scratch and gets
+    mov [es:0], dl          ;   clobbered, 0x2F000 is untouched free RAM
 
     mov ax, 0x0000          ; ES:BX = 0x0000:0x7E00 = physical 0x7E00
     mov es, ax
