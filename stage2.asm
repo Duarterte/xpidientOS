@@ -1,371 +1,138 @@
+; ===========================================================================
+; stage2.asm - stage 2.  No output, no IDT, no PIC, no PIT.
+;   1. read the kernel from LBA 64 into a low staging buffer
+;   2. enable A20, load a GDT, enter 32-bit protected mode
+;   3. copy the kernel to 0x100000, build page tables, enter long mode
+;   4. jump to 0x100000 - everything after that is C
+; ===========================================================================
 [BITS 16]
-[ORG 0x7E00]                ; loaded at 0x0000:0x7E00 -> labels ARE physical
+[ORG 0x7E00]                    ; loaded at 0x0000:0x7E00, so labels ARE physical
+
+%define DRIVE_SEG    0x2F00     ; :0 holds the boot drive number from stage1
+%define KERNEL_LBA   64         ; frozen contract: kernel image starts here
+%define KERNEL_SECS  64         ; 32 KiB
+%define STAGE_BUF    0x30000    ; low staging buffer (BIOS cannot write above 1 MiB)
+%define KERNEL_DEST  0x100000   ; where the kernel must actually run
 
 start:
     cli
-    xor ax, ax              ; DS = 0 so DS:offset == physical address
+    xor ax, ax
     mov ds, ax
     mov ss, ax
     mov sp, 0x7C00
     sti
     cld
 
-    mov ax, 0xB800
-    mov es, ax
-    mov al, 0x0F            ; fill attribute: white on black
-    call clear_vga
+    call load_kernel
 
-    mov si, msg
-    xor di, di
-    mov ah, 0x0A            ; light green on black
-    call puts
-    call sync_cursor        ; hardware cursor follows the text
-    call load_kernel        ; read the C kernel to 0x100000 (still real mode)
     cli
-    in al, 0x92
+    in al, 0x92                 ; A20 gate open
     or al, 2
-    out 0x92, al             ; A20 gate
+    out 0x92, al
 
     lgdt [gdtr]
     mov eax, cr0
-    or eax, 1
-    mov cr0, eax             ; CR0.PE
-    jmp dword 0x08:pm32      ; far jump - no return
-
-; ---- 16-bit data: never executed, only read ----
-msg: db "Stage 2 loaded!", 0
-
-gdt:
-    dq 0x0000000000000000    ; 0x00 null descriptor (required)
-    dq 0x00CF9A000000FFFF    ; 0x08 code: base 0, 4 GiB, 32-bit, readable
-    dq 0x00CF92000000FFFF    ; 0x10 data: base 0, 4 GiB, writable
-    dq 0x00AF9A000000FFFF    ; 0x18 0x18 code 64-bit
-gdt_end:
-
-gdtr:
-    dw gdt_end - gdt - 1     ; limit = size - 1
-    dd gdt                   ; linear base (physical, thanks to ORG 0x7E00)
-
-idtr:
-    dw 256*8 - 1             ; limit = 256 gates * 8 bytes - 1
-    dd idt_table             ; linear base (physical, thanks to ORG 0x7E00)
+    or eax, 1                   ; CR0.PE
+    mov cr0, eax
+    jmp dword 0x08:pm32         ; far jump - CS comes from the GDT
 
 ; ---------------------------------------------------------------------------
-; KERNEL LOADER (real mode, before the switch - int 0x13 dies in long mode)
-;
-; The kernel is a flat binary at LBA 64 (frozen contract, todo item 9).
-; Destination: physical 0x100000, built from segment:offset as
-;     0xFFFF * 16 + 0x0010 = 0xFFFF0 + 0x10 = 0x100000
-; Real mode can reach that because A20 is open, and this is a PIO read (not
-; DMA), so the buffer need not sit below 1 MiB.
-; 64 sectors = 32 KiB, so offset 0x0010..0x8010 never crosses a 64 KiB boundary.
-;
-; NOTE: the boot drive number is stored at 0x2F000 (segment 0x2F00, offset 0)
-; because 0x0500-0x051F is SeaBIOS scratch and gets clobbered.
+; load_kernel - int 0x13 AH=0x42, Disk Address Packet -> 0x30000
 ; ---------------------------------------------------------------------------
-%define DRIVE_SEG    0x2F00     ; segment whose :0000 holds the boot drive
-%define KERNEL_LBA   64
-%define KERNEL_SECS  64
-%define STATUS_SEG   0x2F00     ; :0100 = 1 on success, 0xEE on failure
-%define STAGE_BUF    0x30000    ; low staging buffer (192 KiB) - free RAM
-%define KERNEL_DEST  0x100000   ; where the kernel must actually run
-
 load_kernel:
     mov word  [dap + 0],  16              ; packet size
     mov word  [dap + 1],  0               ; reserved
     mov word  [dap + 2],  KERNEL_SECS     ; sector count
     mov word  [dap + 4],  0x0000          ; buffer offset
-    mov word  [dap + 6],  0x3000          ; buffer segment -> 0x30000 staging
+    mov word  [dap + 6],  0x3000          ; buffer segment -> 0x30000
     mov dword [dap + 8],  KERNEL_LBA      ; LBA low
     mov dword [dap + 12], 0               ; LBA high
 
     push ds
     mov ax, DRIVE_SEG
     mov ds, ax
-    mov dl, [0]                           ; the drive number stage1 saved
+    mov dl, [0]
     pop ds
 
     mov si, dap
-    mov ah, 0x42                          ; extended read (LBA)
+    mov ah, 0x42
     int 0x13
     jc .error
-
-    push ds
-    mov ax, STATUS_SEG
-    mov ds, ax
-    mov byte [0x100], 1                   ; marker: kernel staged OK
-    pop ds
     ret
 
 .error:
-    push ds
-    mov ax, STATUS_SEG
-    mov ds, ax
-    mov byte [0x100], 0xEE                ; marker: staging FAILED
-    pop ds
-
-    mov ax, 0xB800
+    mov ax, 0xB800              ; red 'E' in the top-left corner
     mov es, ax
-    mov si, msg_kmfail
-    mov di, 960                           ; row 6
-    mov ah, 0x0C
-    call puts
-    call halt
+    mov ax, 0x0C45
+    mov [es:0], ax
+    cli
+.h: hlt
+    jmp .h
 
 align 4
 dap:
     times 16 db 0
 
-msg_kmfail: db "KERNEL LOAD FAILED (LBA 64): int13h error", 0
+; ---- data (never executed) ----
+gdt:
+    dq 0x0000000000000000       ; 0x00 null descriptor (required)
+    dq 0x00CF9A000000FFFF       ; 0x08 code 32-bit (D=1)
+    dq 0x00CF92000000FFFF       ; 0x10 data
+    dq 0x00AF9A000000FFFF       ; 0x18 code 64-bit (L=1, D=0)
+gdt_end:
 
-%include "lib.asm"           ; MUST stay in the [BITS 16] region
+gdtr:
+    dw gdt_end - gdt - 1
+    dd gdt                      ; linear base = physical, thanks to ORG 0x7E00
 
-; ---- 32-bit code ----
+; ===========================================================================
 [BITS 32]
 pm32:
-    mov ax, 0x10             ; data selector - reload ALL of them
+    mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
     mov ss, ax
-    mov esp, 0x90000         ; new stack, below VGA at 0xA0000
+    mov esp, 0x90000            ; 16-byte aligned stack, below VGA at 0xA0000
 
-    call idt_setup           ; build 256 gates, then lidt
-    call pic_remap           ; IRQ0..15 -> vectors 0x20..0x2F
-    call pit_init            ; channel 0 at 100 Hz
-
-    mov esi, pm_msg
-    mov edi, 0xB8000 + 320   ; row 2, keeps row 0 visible
-    mov ah, 0x0F             ; white on black
-    call puts32
-
-    ; ---- M2.1: go to long mode ----
-    ; No timer loop here any more: IRQs stay off because the 8-byte IDT
-    ; gates used above are invalid in 64-bit mode. Interrupts return in M2.6
-    ; with 16-byte gates.
-    cli
-    call copy_kernel         ; 0x30000 -> 0x100000 (flat 32-bit addressing)
-    call build_pagetables
-    call enter_long          ; never returns
-.h: hlt
-    jmp .h
+    call copy_kernel            ; 0x30000 -> 0x100000
+    call build_pagetables       ; identity map 4 GiB with 2 MiB pages
+    jmp enter_long              ; never returns
 
 ; ---------------------------------------------------------------------------
-; copy_kernel - move the staged kernel image from low memory to 0x100000
-;   Real mode CANNOT be asked to place it there: the BIOS refuses a read
-;   whose buffer is above 1 MiB. So we read low (0x30000) and copy here,
-;   where flat 32-bit segments make any address reachable.
-;   Size: KERNEL_SECS * 512 bytes = 32 KiB = 8192 dwords.
+; copy_kernel - rep movsd KERNEL_SECS*512 bytes from staging to 0x100000
 ; ---------------------------------------------------------------------------
 copy_kernel:
-    push esi
-    push edi
-    push ecx
     cld
     mov esi, STAGE_BUF
     mov edi, KERNEL_DEST
     mov ecx, (KERNEL_SECS * 512) / 4
     rep movsd
-    pop ecx
-    pop edi
-    pop esi
     ret
 
 ; ---------------------------------------------------------------------------
-; puts32 - 32-bit VGA writer
-;   in:  ESI = string, EDI = 0xB8000 ofs, AH = attribute
-;   out: EDI advanced past the text
-;   clobbers: EAX, ESI, EDI   (DS must have base 0)
+; build_pagetables - PML4 @0x20000, PDPT @0x21000, 4 PDs @0x22000..0x25000
 ; ---------------------------------------------------------------------------
-puts32:
-    lodsb
-    test al, al
-    jz .done
-    stosw
-    jmp puts32
-.done:
-    ret
-
-; ---------------------------------------------------------------------------
-; idt_setup - fill all 256 gates with isr_default, then vector 0 = isr0
-;   Every gate is 8 bytes:
-;     +0 offset 15:0 | +2 CS | +4 zero | +5 type_attr | +6 offset 31:16
-;   type_attr 0x8E = present, DPL 0, 32-bit INTERRUPT gate (clears IF)
-; ---------------------------------------------------------------------------
-idt_setup:
-    mov edi, idt_table
-    mov ecx, 256
-    mov ebx, isr_default
-.fill:
-    mov eax, ebx
-    mov [edi], ax            ; offset 15:0
-    mov word [edi+2], 0x08   ; CS = code selector from the GDT
-    mov byte [edi+4], 0      ; reserved, must be 0
-    mov byte [edi+5], 0x8E   ; P=1 DPL=0 gate-type=0xE
-    shr eax, 16
-    mov [edi+6], ax          ; offset 31:16
-    add edi, 8
-    dec ecx
-    jnz .fill
-
-    mov edi, idt_table       ; vector 0 -> divide error handler
-    mov eax, isr0
-    mov [edi], ax
-    shr eax, 16
-    mov [edi+6], ax
-
-    mov edi, idt_table + 0x20*8   ; vector 0x20 -> timer (IRQ0 after remap)
-    mov eax, isr_timer
-    mov [edi], ax
-    shr eax, 16
-    mov [edi+6], ax
-
-    lidt [idtr]
-    ret
-
-; ---------------------------------------------------------------------------
-; print_u32 - write EAX as unsigned decimal to ES:DI
-;   in:  EAX = value, EDI = VGA offset
-;        attribute taken from [cur_attr]  <- NOT from AH, because AH is part
-;        of EAX and would corrupt the value being printed.
-;   out: EDI advanced
-;   clobbers: EAX, EBX, ECX, EDX
-; ---------------------------------------------------------------------------
-print_u32:
-    push ebx
-    push ecx
-    push edx
-    mov ecx, 10              ; divisor
-    xor ebx, ebx             ; BL = digit count
-    mov bh, [cur_attr]       ; BH = attribute (survives div)
-.digits:
-    xor edx, edx
-    div ecx                  ; EAX = quotient, EDX = remainder
-    add dl, '0'
-    push edx                 ; digits come out reversed
-    inc bl
-    test eax, eax
-    jnz .digits
-.print:
-    pop edx
-    mov al, dl
-    mov ah, bh
-    stosw
-    dec bl
-    jnz .print
-    pop edx
-    pop ecx
-    pop ebx
-    ret
-
-; ---------------------------------------------------------------------------
-; pic_remap - move hardware IRQs off the CPU exception vectors
-;   Without this, IRQ0 (timer) arrives on vector 0x08 = #DF = triple fault.
-; ---------------------------------------------------------------------------
-pic_remap:
-    mov al, 0x11
-    out 0x20, al             ; ICW1 master: init, ICW4 will follow
-    out 0xA0, al             ; ICW1 slave
-
-    mov al, 0x20
-    out 0x21, al             ; ICW2 master: IRQ0..7  -> 0x20..0x27
-    mov al, 0x28
-    out 0xA1, al             ; ICW2 slave : IRQ8..15 -> 0x28..0x2F
-
-    mov al, 0x04
-    out 0x21, al             ; ICW3 master: slave is on IRQ2
-    mov al, 0x02
-    out 0xA1, al             ; ICW3 slave : cascade identity 2
-
-    mov al, 0x01
-    out 0x21, al             ; ICW4: 8086 mode
-    out 0xA1, al
-
-    mov al, 0xFE
-    out 0x21, al             ; mask everything except IRQ0 (timer)
-    mov al, 0xFF
-    out 0xA1, al             ; slave fully masked
-    ret
-
-; ---------------------------------------------------------------------------
-; pit_init - channel 0, mode 3, 100 Hz
-;   1193182 / 100 = 11931 = 0x2E9B
-; ---------------------------------------------------------------------------
-pit_init:
-    mov al, 0x36             ; ch0, lobyte/hibyte, mode 3, binary
-    out 0x43, al
-    mov ax, 11931
-    out 0x40, al             ; low byte first
-    mov al, ah
-    out 0x40, al             ; then high byte
-    ret
-
-; ---------------------------------------------------------------------------
-; isr_timer - IRQ0, vector 0x20. MUST return, MUST send EOI.
-;   No EOI  -> the PIC never delivers IRQ0 again (one tick, then silence).
-;   No iret -> the main loop never resumes.
-; ---------------------------------------------------------------------------
-isr_timer:
-    push eax
-    inc dword [tick]
-    mov al, 0x20
-    out 0x20, al             ; EOI to the master PIC
-    pop eax
-    iret
-
-; ---------------------------------------------------------------------------
-; isr0 - vector 0, divide error. The CPU pushes EIP, CS, EFLAGS - NO error
-;        code. We do not return: halt and let the screen keep the evidence.
-; ---------------------------------------------------------------------------
-isr0:
-    mov esi, msg_de
-    mov edi, 0xB8000 + 480   ; row 3 - row 2 holds the PM message
-    mov ah, 0x0C             ; light red
-    call puts32
-.h: cli
-    hlt
-    jmp .h
-
-; ---------------------------------------------------------------------------
-; isr_default - every other vector. Pushed frame differs per vector
-;               (some push an error code) - which is why we never iret here.
-; ---------------------------------------------------------------------------
-isr_default:
-    mov esi, msg_unk
-    mov edi, 0xB8000 + 320
-    mov ah, 0x0E             ; yellow
-    call puts32
-.h: cli
-    hlt
-    jmp .h
-
 build_pagetables:
     push eax
     push ecx
     push edi
 
-    ; zero 24 KiB so every unused entry reads as "not present"
-    mov edi, 0x20000
+    mov edi, 0x20000            ; clear all 24 KiB
     mov ecx, 0x6000/4
     xor eax, eax
     rep stosd
 
-    ; PML4[0] -> PDPT
-    mov dword [0x20000], 0x21000 | 3     ; present | writable
-
-    ; PDPT[0..3] -> four PD pages (each PD covers 1 GiB)
-    mov dword [0x21000 + 0*8], 0x22000 | 3
+    mov dword [0x20000], 0x21000 | 3          ; PML4[0] -> PDPT
+    mov dword [0x21000 + 0*8], 0x22000 | 3    ; PDPT[0..3] -> 4 PDs
     mov dword [0x21000 + 1*8], 0x23000 | 3
     mov dword [0x21000 + 2*8], 0x24000 | 3
     mov dword [0x21000 + 3*8], 0x25000 | 3
 
-    ; 2048 PD entries -> 2048 x 2 MiB = 4 GiB, identity mapped
-    ; flags 0x83 = present | writable | PS (huge page, no PT below)
-    ; FIRST entry MUST map physical 0, so it starts at 0x83, not 0x200083
     mov edi, 0x22000
-    mov eax, 0x000000 | 0x83
-    mov ecx, 2048
+    mov eax, 0x000000 | 0x83    ; first entry maps physical 0, PS=huge page
+    mov ecx, 2048               ; 2048 * 2 MiB = 4 GiB
 .fill:
     mov [edi], eax
     add eax, 0x200000
@@ -379,97 +146,56 @@ build_pagetables:
     ret
 
 ; ---------------------------------------------------------------------------
-; enter_long - 32-bit protected mode -> IA-32e (long mode)
-;   Every step is required and the order cannot change.
+; enter_long - 32-bit protected mode -> IA-32e.  Order is mandatory.
 ; ---------------------------------------------------------------------------
 enter_long:
-    ; 1. does this CPU even have long mode?
-    mov eax, 0x80000000
+    mov eax, 0x80000000         ; is long mode available at all?
     cpuid
     cmp eax, 0x80000001
     jb .no_lm
     mov eax, 0x80000001
     cpuid
-    test edx, 1 << 29                ; EDX bit 29 = LM
+    test edx, 1 << 29
     jz .no_lm
 
-    ; 2. PML4 physical address into CR3
-    mov eax, 0x20000
+    mov eax, 0x20000            ; CR3 = physical address of PML4
     mov cr3, eax
 
-    ; 3. PAE - long mode is a PAE extension, not an alternative
     mov eax, cr4
-    or eax, 1 << 5                   ; CR4.PAE
+    or eax, 1 << 5              ; CR4.PAE (long mode is a PAE extension)
     mov cr4, eax
 
-    ; 4. EFER: LME arms long mode, NXE enables the NX page bit
-    mov ecx, 0xC0000080              ; IA32_EFER
+    mov ecx, 0xC0000080         ; IA32_EFER
     rdmsr
-    or eax, (1 << 8) | (1 << 11)     ; LME | NXE
-    xor edx, edx                     ; clear high bits from firmware
+    or eax, (1 << 8) | (1 << 11) ; LME | NXE
+    xor edx, edx
     wrmsr
 
-    ; 5. PG + PE together activate long mode (LME alone does nothing)
     mov eax, cr0
-    or eax, 0x80000001               ; CR0.PG | CR0.PE
+    or eax, 0x80000001          ; PG + PE together activate long mode
     mov cr0, eax
 
-    ; 6. far jump - validates CS against the L=1 descriptor
-    jmp 0x18:pm64
+    jmp 0x18:pm64               ; far jump - validates the L=1 descriptor
 
 .no_lm:
-    mov esi, msg_nolm
-    mov edi, 0xB8000 + 800
-    mov ah, 0x0C
-    call puts32
+    mov ax, 0xB800              ; red 'L' in the top-left corner
+    mov es, ax
+    mov ax, 0x0C4C
+    mov [es:0], ax
     cli
 .h: hlt
     jmp .h
 
-pm_msg:   db "Protected mode: 32-bit!", 0
-msg_de:   db "EXCEPTION 0: divide error caught", 0
-msg_unk:  db "EXCEPTION: unexpected vector", 0
-msg_timer: db "Timer: ", 0
-msg_nolm: db "CPU has no long mode - halting", 0
-
-tick: dd 0                   ; incremented by isr_timer at 100 Hz
-cur_attr: db 0x0F            ; current VGA attribute for print_u32
-
-align 8
-idt_table:
-    times 256*8 db 0         ; 2048 bytes, filled at runtime by idt_setup
-
-; ---- 64-bit code ----
+; ===========================================================================
 [BITS 64]
 pm64:
-    mov ax, 0x10                   ; data selector (validated, then ignored)
+    mov ax, 0x10                ; data selectors (validated, then ignored)
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
     mov ss, ax
-    mov rsp, 0x90000               ; 16-byte aligned
+    mov rsp, 0x90000
 
-    mov rsi, msg64
-    mov rdi, 0xB8000 + 800         ; row 5
-    mov ah, 0x0B                   ; light cyan
-    call puts64
-
-    ; ---- hand off to the C kernel at 0x100000 ----
-    mov rax, 0x100000
-    jmp rax                        ; jumps to _start, never returns
-
-.h: cli
-    hlt
-    jmp .h
-
-puts64:
-    lodsb                          ; AL = [RSI], RSI++
-    test al, al
-    jz .done
-    stosw                          ; [RDI] = AX, RDI += 2
-    jmp puts64
-.done:
-    ret
-
-msg64: db "LONG MODE: 64-bit, 16 registers!", 0
+    mov rax, KERNEL_DEST
+    jmp rax                     ; -> _start in the C kernel, never returns

@@ -19,7 +19,7 @@ QEMU     := qemu-system-x86_64
 QFLAGS   := -drive format=raw,file=$(IMG)
 
 NASM     := nasm
-NFLAGS   := -f bin -I $(LIB)/
+NFLAGS   := -f bin
 
 CC       := gcc
 CFLAGS   := -m64 -ffreestanding -fno-pie -fno-stack-protector \
@@ -40,7 +40,7 @@ $(OUT):
 	mkdir -p $(OUT)
 
 # ---- stage1: must be exactly 512 bytes ----
-$(STAGE1): boot.asm $(LIB)/lib.asm | $(OUT)
+$(STAGE1): boot.asm | $(OUT)
 	$(NASM) $(NFLAGS) $< -o $@
 	@sz=$$(stat -c%s $@); \
 	if [ $$sz -ne $(BOOTSZ) ]; then \
@@ -49,7 +49,7 @@ $(STAGE1): boot.asm $(LIB)/lib.asm | $(OUT)
 	fi
 
 # ---- stage2: pad to a whole sector ----
-$(STAGE2): stage2.asm $(LIB)/lib.asm | $(OUT)
+$(STAGE2): stage2.asm | $(OUT)
 	$(NASM) $(NFLAGS) $< -o $@
 	@sz=$$(stat -c%s $@); pad=$$(( (512 - sz % 512) % 512 )); \
 	if [ $$pad -ne 0 ]; then truncate -s $$((sz+pad)) $@; fi
